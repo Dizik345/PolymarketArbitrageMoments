@@ -1,24 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-main.py
-
-Команды:
-- monitor : короткий монитор bid/ask + Binance mark/funding
-- hedge   : один расчёт хеджа (коротко, WIN/LOSE разложение)
-- live    : monitor + hedge каждый тик
-- live --graph : live + график Ask vs NeedAsk (без лагов: сеть в фоне, график в main thread)
-
-Новая фича:
-- --both : считать hedge для ОБОИХ исходов (например 80k и 100k) в одном тике
-           и печатать need ask для каждого.
-
-График:
-- если --both --graph: рисует ask/need для каждого исхода (4 линии)
-- красные точки: моменты когда ask <= need (feasible) для соответствующего исхода
-"""
-
 import argparse
 import asyncio
 import json
@@ -39,9 +18,7 @@ POLY_CLOB = "https://clob.polymarket.com"
 BINANCE_FAPI = "https://fapi.binance.com"
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
+
 def make_ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=certifi.where())
 
@@ -84,9 +61,6 @@ def best_bid_ask(book: dict) -> Tuple[Optional[float], Optional[float]]:
     return best_bid, best_ask
 
 
-# -----------------------------
-# Data models
-# -----------------------------
 @dataclass
 class OutcomeQuote:
     outcome: str
