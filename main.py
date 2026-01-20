@@ -1,15 +1,14 @@
+# main.py
 import argparse
 import asyncio
 import json
 import math
 import re
 import ssl
-import threading
-import queue
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
-
+import signal
 import aiohttp
 import certifi
 
@@ -18,7 +17,9 @@ POLY_CLOB = "https://clob.polymarket.com"
 BINANCE_FAPI = "https://fapi.binance.com"
 
 
-
+# -----------------------------
+# Utils
+# -----------------------------
 def make_ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=certifi.where())
 
@@ -61,6 +62,27 @@ def best_bid_ask(book: dict) -> Tuple[Optional[float], Optional[float]]:
     return best_bid, best_ask
 
 
+def parse_levels_from_text(text: str) -> List[float]:
+    t = (text or "").lower().replace(",", "")
+    levels: List[float] = []
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*k", t):
+        levels.append(float(m.group(1)) * 1000.0)
+    for m in re.finditer(r"\b(\d{4,7})\b", t):
+        v = float(m.group(1))
+        if v >= 1000:
+            levels.append(v)
+    uniq = sorted(set(int(x) for x in levels))
+    return [float(x) for x in uniq]
+
+
+def extract_level_from_outcome(outcome: str) -> Optional[float]:
+    lv = parse_levels_from_text(outcome)
+    return lv[0] if lv else None
+
+
+# -----------------------------
+# Dataclasses
+# -----------------------------
 @dataclass
 class OutcomeQuote:
     outcome: str
@@ -70,20 +92,9 @@ class OutcomeQuote:
 
 
 @dataclass
-class HedgeResult:
-    side_model: str
-    qty_btc_model: float
-    pnl_win_total: float
-    pnl_lose_total: float
-    fut_per1_win: float
-    fut_per1_lose: float
-    ok: bool
-
-
-@dataclass
 class GraphPoint:
     ts: datetime
-    # series: [(outcome_name, ask, need)]
+    # list of (outcome, ask, need_ask)
     series: List[Tuple[str, Optional[float], Optional[float]]]
 
 
@@ -210,6 +221,7 @@ def futures_pnl_per_1btc(
     funding_rate_per_8h: float,
     expected_hours: float,
 ) -> float:
+    # side: "long" or "short"
     s = 1.0 if side.lower() == "long" else -1.0
     periods = max(0, math.ceil(max(0.0, expected_hours) / 8.0))
     pnl_price = s * (exit_price - entry)
@@ -219,89 +231,15 @@ def futures_pnl_per_1btc(
     return pnl_price - fee_open - fee_close - funding_payment
 
 
-# -----------------------------
-# Parse barrier levels
-# -----------------------------
-def parse_levels_from_text(text: str) -> List[float]:
-    t = (text or "").lower().replace(",", "")
-    levels: List[float] = []
-    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*k", t):
-        levels.append(float(m.group(1)) * 1000.0)
-    for m in re.finditer(r"\b(\d{4,7})\b", t):
-        v = float(m.group(1))
-        if v >= 1000:
-            levels.append(v)
-    uniq = sorted(set(int(x) for x in levels))
-    return [float(x) for x in uniq]
-
-
-def extract_level_from_outcome(outcome: str) -> Optional[float]:
-    lv = parse_levels_from_text(outcome)
-    return lv[0] if lv else None
-
-
-# -----------------------------
-# Hedge math
-# -----------------------------
-def solve_hedge_qty_for_breakeven_win(
-    poly_pnl_win: float,
-    poly_pnl_lose: float,
-    fut_per1_win: float,
-    fut_per1_lose: float,
-    desired_plus_on_lose: float,
-    side_model: str,
-) -> HedgeResult:
-    if abs(fut_per1_win) < 1e-12:
-        return HedgeResult(side_model, float("nan"), float("nan"), float("nan"), fut_per1_win, fut_per1_lose, False)
-
-    qty = -poly_pnl_win / fut_per1_win
-    pnl_win_total = poly_pnl_win + qty * fut_per1_win
-    pnl_lose_total = poly_pnl_lose + qty * fut_per1_lose
-    ok = pnl_lose_total >= desired_plus_on_lose
-    return HedgeResult(side_model, qty, pnl_win_total, pnl_lose_total, fut_per1_win, fut_per1_lose, ok)
-
-
-def required_poly_ask_for_target(
-    stake_usdc: float,
-    fee_rate_bps: int,
-    desired_plus: float,
-    fut_per1_win: float,
-    fut_per1_lose: float,
-) -> Optional[float]:
-    def feasible(p: float) -> bool:
-        poly = polymarket_pnl(stake_usdc, p, fee_rate_bps)
-        if abs(fut_per1_win) < 1e-12:
-            return False
-        qty = -poly["pnl_win"] / fut_per1_win
-        pnl_lose_total = poly["pnl_lose"] + qty * fut_per1_lose
-        return pnl_lose_total >= desired_plus
-
-    lo, hi = 0.01, 0.99
-    if not feasible(lo):
-        return None
-    if feasible(hi):
-        return hi
-
-    best = lo
-    for _ in range(60):
-        mid = (lo + hi) / 2.0
-        if feasible(mid):
-            best = mid
-            lo = mid
-        else:
-            hi = mid
-    return best
-
-
 def pretty_position(side_model: str, qty_btc_model: float) -> Tuple[str, float]:
+    # qty_btc_model is in "model-side" space; if negative => opposite side.
     if math.isnan(qty_btc_model):
         return ("UNKNOWN", float("nan"))
-    side_model = side_model.lower().strip()
-    if qty_btc_model == 0:
+    if abs(qty_btc_model) < 1e-18:
         return ("FLAT", 0.0)
     if qty_btc_model > 0:
-        return ("LONG" if side_model == "long" else "SHORT", abs(qty_btc_model))
-    return ("SHORT" if side_model == "long" else "LONG", abs(qty_btc_model))
+        return ("LONG" if side_model.lower() == "long" else "SHORT", abs(qty_btc_model))
+    return ("SHORT" if side_model.lower() == "long" else "LONG", abs(qty_btc_model))
 
 
 # -----------------------------
@@ -323,25 +261,16 @@ async def load_event_markets(session: aiohttp.ClientSession, event_url: str) -> 
     return title, [market]
 
 
-def pick_outcome_token(pairs: List[Tuple[str, str]], buy_outcome: str) -> Optional[Tuple[str, str]]:
-    needle = (buy_outcome or "").strip().lower()
-    for outcome, tid in pairs:
-        if needle and needle in outcome.lower():
-            return outcome, tid
-    if len(pairs) == 2 and needle in ("yes", "no"):
-        return pairs[0] if needle == "yes" else pairs[1]
-    return None
-
-
 # -----------------------------
-# Output helpers
+# Printing
 # -----------------------------
 def print_monitor_lines(quotes: List[OutcomeQuote]):
     for q in quotes:
         bid_s = f"{q.best_bid:.4f}" if q.best_bid is not None else "—"
         ask_s = f"{q.best_ask:.4f}" if q.best_ask is not None else "—"
-        print(f"  {q.outcome:<8} bid {bid_s:<7} ask {ask_s:<7}")
+        print(f"  {q.outcome:<6}  bid {bid_s:<7} ask {ask_s:<7}")
 
+    # internal arb only if Σasks < 1
     asks = [q.best_ask for q in quotes if q.best_ask is not None]
     if len(asks) == len(quotes):
         s = sum(asks)
@@ -350,8 +279,46 @@ def print_monitor_lines(quotes: List[OutcomeQuote]):
 
 
 # -----------------------------
-# Core: compute hedge for one chosen outcome inside one market
+# Hedge math
 # -----------------------------
+def solve_qty_for_win_zero(poly_pnl_win: float, fut_per1_win: float) -> Optional[float]:
+    if abs(fut_per1_win) < 1e-12:
+        return None
+    return -poly_pnl_win / fut_per1_win
+
+
+def required_poly_ask_for_target(
+    stake_usdc: float,
+    fee_rate_bps: int,
+    desired_plus_on_lose: float,
+    fut_per1_win: float,
+    fut_per1_lose: float,
+) -> Optional[float]:
+    def ok(p: float) -> bool:
+        poly = polymarket_pnl(stake_usdc, p, fee_rate_bps)
+        qty = solve_qty_for_win_zero(poly["pnl_win"], fut_per1_win)
+        if qty is None:
+            return False
+        lose_total = poly["pnl_lose"] + qty * fut_per1_lose
+        return lose_total >= desired_plus_on_lose
+
+    lo, hi = 0.01, 0.99
+    if not ok(lo):
+        return None
+    if ok(hi):
+        return hi
+
+    best = lo
+    for _ in range(70):
+        mid = (lo + hi) / 2.0
+        if ok(mid):
+            best = mid
+            lo = mid
+        else:
+            hi = mid
+    return best
+
+
 async def compute_hedge_for_outcome(
     session: aiohttp.ClientSession,
     pairs: List[Tuple[str, str]],
@@ -366,8 +333,8 @@ async def compute_hedge_for_outcome(
     close_fee_rate: float,
 ) -> Tuple[Optional[float], Optional[float]]:
     """
-    Returns: (ask, need_ask)
-    Also prints short hedge block.
+    Prints compact hedge block.
+    Returns (ask, need_ask).
     """
     books = await clob_get_books(session, [token_id])
     _bid, ask = best_bid_ask(books.get(token_id, {}))
@@ -378,7 +345,7 @@ async def compute_hedge_for_outcome(
     fee_bps = await polymarket_fee_rate_bps(session, token_id)
     poly = polymarket_pnl(stake_usdc, ask, fee_bps)
 
-    # barriers from outcomes text like "80k"/"100k"
+    # parse barriers from outcomes like "80k"/"100k"
     outcome_levels: Dict[str, float] = {}
     for o, _tid in pairs:
         lv = extract_level_from_outcome(o)
@@ -396,52 +363,61 @@ async def compute_hedge_for_outcome(
         print(f"  HEDGE({outcome_name}): can't parse barriers from outcomes")
         return float(ask), None
 
-    # choose best of (model LONG or model SHORT)
-    candidates: List[HedgeResult] = []
+    # try both model sides; pick one that maximizes LOSE total
+    best = None  # (side_model, qty_model, fut_win, fut_lose, lose_total, win_total)
     for side_model in ("long", "short"):
-        fut_win = futures_pnl_per_1btc(side_model, entry, win_exit, open_fee_rate, close_fee_rate, fund, expected_hours)
-        fut_lose = futures_pnl_per_1btc(side_model, entry, lose_exit, open_fee_rate, close_fee_rate, fund, expected_hours)
-        candidates.append(
-            solve_hedge_qty_for_breakeven_win(
-                poly_pnl_win=poly["pnl_win"],
-                poly_pnl_lose=poly["pnl_lose"],
-                fut_per1_win=fut_win,
-                fut_per1_lose=fut_lose,
-                desired_plus_on_lose=target_plus,
-                side_model=side_model,
-            )
+        fut_win = futures_pnl_per_1btc(
+            side_model, entry, win_exit, open_fee_rate, close_fee_rate, fund, expected_hours
+        )
+        fut_lose = futures_pnl_per_1btc(
+            side_model, entry, lose_exit, open_fee_rate, close_fee_rate, fund, expected_hours
         )
 
-    candidates.sort(key=lambda x: (x.ok, x.pnl_lose_total), reverse=True)
-    best = candidates[0]
+        qty_model = solve_qty_for_win_zero(poly["pnl_win"], fut_win)
+        if qty_model is None:
+            continue
 
-    eff_side, eff_qty_btc = pretty_position(best.side_model, best.qty_btc_model)
+        win_total = poly["pnl_win"] + qty_model * fut_win
+        lose_total = poly["pnl_lose"] + qty_model * fut_lose
+
+        cand = (side_model, qty_model, fut_win, fut_lose, lose_total, win_total)
+        if best is None or cand[4] > best[4]:
+            best = cand
+
+    if best is None:
+        print(f"  HEDGE({outcome_name}): no hedge candidate")
+        return float(ask), None
+
+    side_model, qty_model, fut_win, fut_lose, lose_total, _win_total = best
+    eff_side, eff_qty_btc = pretty_position(side_model, qty_model)
     notional_usd = eff_qty_btc * entry
 
-    qty_model = best.qty_btc_model
-    bin_win = qty_model * best.fut_per1_win
-    bin_lose = qty_model * best.fut_per1_lose
+    bin_win = qty_model * fut_win
+    bin_lose = qty_model * fut_lose
+
+    ok = lose_total >= target_plus
 
     need_ask = None
-    if not best.ok:
-        need_ask = required_poly_ask_for_target(stake_usdc, fee_bps, target_plus, best.fut_per1_win, best.fut_per1_lose)
+    if not ok:
+        need_ask = required_poly_ask_for_target(stake_usdc, fee_bps, target_plus, fut_win, fut_lose)
 
     print(f"  HEDGE({outcome_name}): ask={ask:.4f} shares≈{poly['shares']:.2f}")
     print(f"    Binance: {eff_side} ${notional_usd:.2f} notional ({eff_qty_btc:.6f} BTC)")
-    print(f"    WIN : Poly {poly['pnl_win']:+.2f}, Binance {bin_win:+.2f} => Total {(poly['pnl_win']+bin_win):+.2f}")
-    print(f"    LOSE: Poly {poly['pnl_lose']:+.2f}, Binance {bin_lose:+.2f} => Total {(poly['pnl_lose']+bin_lose):+.2f}")
-
-    if not best.ok:
+    print(f"    WIN :  Poly {poly['pnl_win']:+.2f}, Binance {bin_win:+.2f} => Total {(poly['pnl_win']+bin_win):+.2f}")
+    print(f"    LOSE:  Poly {poly['pnl_lose']:+.2f}, Binance {bin_lose:+.2f} => Total {(poly['pnl_lose']+bin_lose):+.2f}")
+    if not ok:
         if need_ask is None:
             print("    ❌ not feasible (assumptions)")
         else:
             print(f"    ❌ need ask <= {need_ask:.4f} to be feasible")
+    else:
+        print("  ✅✅✅ КНОПКА БАБЛО ✅✅✅")
 
     return float(ask), (None if need_ask is None else float(need_ask))
 
 
 # -----------------------------
-# One tick for one event URL
+# One tick for one URL
 # -----------------------------
 async def compute_tick(
     session: aiohttp.ClientSession,
@@ -464,41 +440,32 @@ async def compute_tick(
     print(f"\n[{now_str()}] Binance {binance_symbol} mark={entry:.2f} funding8h={fund:+.6%}")
     print(f"EVENT: {title}")
 
-    # monitor all markets, choose first market that contains needed outcome (or any for both)
-    chosen_market = None
-    chosen_pairs = None
+    chosen_pairs: Optional[List[Tuple[str, str]]] = None
 
+    # monitor all markets
     for m in markets:
         pairs = market_outcome_token_map(m)
         token_ids = [tid for _, tid in pairs]
         books = await clob_get_books(session, token_ids)
+
         quotes = []
         for outcome, tid in pairs:
             bid, ask = best_bid_ask(books.get(tid, {}))
             quotes.append(OutcomeQuote(outcome, tid, bid, ask))
+
         print_monitor_lines(quotes)
 
-        if chosen_market is None:
-            if both:
-                # pick first market with at least 2 outcomes (typical)
-                if len(pairs) >= 2:
-                    chosen_market = m
-                    chosen_pairs = pairs
-            else:
-                picked = pick_outcome_token(pairs, buy_outcome)
-                if picked:
-                    chosen_market = m
-                    chosen_pairs = pairs
+        # choose first "normal" market (2+ outcomes)
+        if chosen_pairs is None and len(pairs) >= 2:
+            chosen_pairs = pairs
 
-    if chosen_market is None or chosen_pairs is None:
+    if chosen_pairs is None:
         print("  HEDGE: can't choose market for hedge (no suitable outcomes)")
         return GraphPoint(datetime.now(), [])
 
-    # hedge calc
     series: List[Tuple[str, Optional[float], Optional[float]]] = []
 
     if both:
-        # compute for all outcomes in that market (usually 2)
         for outcome_name, token_id in chosen_pairs:
             a, n = await compute_hedge_for_outcome(
                 session=session,
@@ -515,10 +482,17 @@ async def compute_tick(
             )
             series.append((outcome_name, a, n))
     else:
-        picked = pick_outcome_token(chosen_pairs, buy_outcome)
+        # pick by substring
+        needle = (buy_outcome or "").strip().lower()
+        picked = None
+        for o, tid in chosen_pairs:
+            if needle in o.lower():
+                picked = (o, tid)
+                break
         if not picked:
             print(f"  HEDGE: outcome '{buy_outcome}' not found")
             return GraphPoint(datetime.now(), [])
+
         outcome_name, token_id = picked
         a, n = await compute_hedge_for_outcome(
             session=session,
@@ -539,7 +513,7 @@ async def compute_tick(
 
 
 # -----------------------------
-# Modes (no graph)
+# Modes
 # -----------------------------
 async def run_monitor(urls: List[str], interval: int, binance_symbol: str):
     ssl_ctx = make_ssl_context()
@@ -547,7 +521,9 @@ async def run_monitor(urls: List[str], interval: int, binance_symbol: str):
     async with aiohttp.ClientSession(connector=connector) as session:
         while True:
             prem = await binance_premium_index(session, binance_symbol)
-            print(f"[{now_str()}] Binance {binance_symbol} mark={prem['markPrice']:.2f} funding8h={prem['lastFundingRate']:+.6%}")
+            print(
+                f"[{now_str()}] Binance {binance_symbol} mark={prem['markPrice']:.2f} funding8h={prem['lastFundingRate']:+.6%}"
+            )
             for url in urls:
                 title, markets = await load_event_markets(session, url)
                 print(f"EVENT: {title}")
@@ -627,9 +603,94 @@ async def run_live(
 
 
 # -----------------------------
-# Graph mode (NO LAG): network in background thread
+# Graph mode: collect then plot ONCE on stop (no live updates, no lag)
 # -----------------------------
-def run_live_with_graph(
+def plot_points_once(
+    points: List[GraphPoint],
+    save_png: Optional[str],
+    both: bool,
+    buy_outcome: str,
+):
+    import math as _math
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
+    if not points:
+        print("[PLOT] No points collected.")
+        return
+
+    # outcomes в порядке появления
+    outcomes: List[str] = []
+    seen = set()
+    for p in points:
+        for outcome, _a, _n in p.series:
+            if outcome not in seen:
+                seen.add(outcome)
+                outcomes.append(outcome)
+
+    ts = [p.ts for p in points]
+
+    fig, ax = plt.subplots(figsize=(13, 5))
+    ax.set_title(f"Ask vs NeedAsk ({'BOTH' if both else buy_outcome})")
+    ax.set_xlabel("time")
+    ax.set_ylabel("price")
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+
+    for outcome in outcomes:
+        ask_y: List[float] = []
+        need_y: List[float] = []
+        last_need = float("nan")
+
+        for p in points:
+            found = None
+            for o, a, n in p.series:
+                if o == outcome:
+                    found = (a, n)
+                    break
+
+            if found is None:
+                ask_y.append(float("nan"))
+                need_y.append(last_need)
+                continue
+
+            a, n = found
+            ask_y.append(float("nan") if a is None else float(a))
+
+            if n is None:
+                need_y.append(last_need)
+            else:
+                last_need = float(n)
+                need_y.append(last_need)
+
+        ax.plot(ts, ask_y, marker="o", markersize=3, linewidth=1.5, label=f"ask {outcome}")
+        ax.plot(ts, need_y, linestyle="--", marker="o", markersize=3, linewidth=1.2, label=f"need {outcome}")
+
+        # feasible: ask <= need
+        fx, fy = [], []
+        for x, a, n in zip(ts, ask_y, need_y):
+            if (not _math.isnan(a)) and (not _math.isnan(n)) and (a <= n):
+                fx.append(x)
+                fy.append(a)
+        if fx:
+            ax.scatter(fx, fy, s=35, alpha=0.9, label=f"feasible {outcome}")
+
+    ax.legend(loc="upper right")
+    fig.autofmt_xdate()
+
+    ymin, ymax = ax.get_ylim()
+    ax.set_ylim(max(0.0, ymin - 0.01), min(1.0, ymax + 0.01))
+
+    plt.tight_layout()
+
+    if save_png:
+        fig.savefig(save_png, dpi=180, bbox_inches="tight")
+        print(f"[OK] saved graph -> {save_png}")
+
+    plt.show()
+
+
+async def run_live_collect_then_plot(
     urls: List[str],
     interval: int,
     binance_symbol: str,
@@ -641,182 +702,83 @@ def run_live_with_graph(
     open_fee_rate: float,
     close_fee_rate: float,
     max_points: int,
-    graph_refresh_ms: int,
+    save_png: Optional[str],
+    exit_on_plot: bool = False,   # <- если True, то после графика выходим
 ):
-    import numpy as np
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
-    from collections import deque
-    from matplotlib.animation import FuncAnimation
+    ssl_ctx = make_ssl_context()
+    connector = aiohttp.TCPConnector(ssl=ssl_ctx)
 
-    q: "queue.Queue[GraphPoint]" = queue.Queue()
-    stop_flag = threading.Event()
+    points: List[GraphPoint] = []
+    print("[INFO] graph mode: collecting points.")
+    print("[INFO] Ctrl+C once  -> plot/save and CONTINUE")
+    print("[INFO] Ctrl+C twice -> exit")
 
-    def worker():
-        async def bg():
-            ssl_ctx = make_ssl_context()
-            connector = aiohttp.TCPConnector(ssl=ssl_ctx)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                while not stop_flag.is_set():
-                    for url in urls:
-                        try:
-                            gp = await compute_tick(
-                                session=session,
-                                url=url,
-                                buy_outcome=buy_outcome,
-                                both=both,
-                                stake_usdc=stake_usdc,
-                                target_plus=target_plus,
-                                expected_hours=expected_hours,
-                                binance_symbol=binance_symbol,
-                                open_fee_rate=open_fee_rate,
-                                close_fee_rate=close_fee_rate,
-                            )
-                            q.put(gp)
-                        except Exception as e:
-                            print(f"[bg] error: {e}")
+    stop_now = False
+    want_plot = False
+    ctrlc_count = 0
 
-                    # sleep in bg loop (responsive stop)
-                    for _ in range(max(1, interval * 10)):
-                        if stop_flag.is_set():
+    loop = asyncio.get_running_loop()
+
+    def on_sigint():
+        nonlocal stop_now, want_plot, ctrlc_count
+        ctrlc_count += 1
+        if ctrlc_count == 1:
+            want_plot = True
+            print("\n[STOP] Ctrl+C -> plotting once, then continuing...")
+        else:
+            stop_now = True
+            print("\n[STOP] Ctrl+C x2 -> exiting...")
+
+    # нормальный обработчик SIGINT вместо KeyboardInterrupt/CancelledError каши
+    loop.add_signal_handler(signal.SIGINT, on_sigint)
+
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            while not stop_now:
+                for url in urls:
+                    gp = await compute_tick(
+                        session=session,
+                        url=url,
+                        buy_outcome=buy_outcome,
+                        both=both,
+                        stake_usdc=stake_usdc,
+                        target_plus=target_plus,
+                        expected_hours=expected_hours,
+                        binance_symbol=binance_symbol,
+                        open_fee_rate=open_fee_rate,
+                        close_fee_rate=close_fee_rate,
+                    )
+
+                    if gp.series:
+                        points.append(gp)
+                        if len(points) > max_points:
+                            points = points[-max_points:]
+
+                # если попросили график — рисуем/сохраняем и продолжаем
+                if want_plot:
+                    want_plot = False
+                    if points:
+                        plot_points_once(points=points, save_png=save_png, both=both, buy_outcome=buy_outcome)
+                        if exit_on_plot:
                             break
-                        await asyncio.sleep(0.1)
+                    else:
+                        print("[WARN] no points collected yet -> nothing to plot.")
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+                    # сбрасываем счетчик, чтобы следующий Ctrl+C снова был "plot"
+                    ctrlc_count = 0
+
+                # сон делаем маленькими кусками, чтобы быстрее реагировать на Ctrl+C
+                for _ in range(max(1, int(interval * 10))):
+                    if stop_now or want_plot:
+                        break
+                    await asyncio.sleep(0.1)
+
+    finally:
+        # возвращаем стандартный SIGINT handler (чтобы в других местах не ломалось)
         try:
-            loop.run_until_complete(bg())
-        finally:
-            loop.close()
-
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-
-    # buffers per outcome
-    ts = deque(maxlen=max_points)
-    asks: Dict[str, deque] = {}
-    needs: Dict[str, deque] = {}
-
-    fig, ax = plt.subplots(figsize=(13, 5))
-    ax.set_title(f"Ask vs NeedAsk ({'BOTH' if both else buy_outcome})")
-    ax.set_xlabel("time")
-    ax.set_ylabel("price")
-    ax.grid(True, alpha=0.3)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
-
-    lines_ask: Dict[str, any] = {}
-    lines_need: Dict[str, any] = {}
-    scatters: Dict[str, any] = {}
-
-    def ensure_series(outcome: str):
-        if outcome not in asks:
-            asks[outcome] = deque(maxlen=max_points)
-            needs[outcome] = deque(maxlen=max_points)
-
-            (la,) = ax.plot([], [], marker="o", markersize=3, linewidth=1.5, label=f"ask {outcome}")
-            (ln,) = ax.plot([], [], linestyle="--", marker="o", markersize=3, linewidth=1.2, label=f"need {outcome}")
-            sc = ax.scatter([], [], s=35, alpha=0.9, label=f"feasible {outcome}")
-
-            lines_ask[outcome] = la
-            lines_need[outcome] = ln
-            scatters[outcome] = sc
-
-            ax.legend(loc="upper right")
-
-    def drain_queue() -> bool:
-        got = False
-        while True:
-            try:
-                p = q.get_nowait()
-            except queue.Empty:
-                break
-
-            if not p.series:
-                continue
-
-            ts.append(p.ts)
-
-            # for each outcome in this point, update buffers
-            for outcome, a, n in p.series:
-                ensure_series(outcome)
-
-                asks[outcome].append(float("nan") if a is None else float(a))
-
-                # need: if None, keep last need if exists else nan
-                if n is None:
-                    needs[outcome].append(needs[outcome][-1] if len(needs[outcome]) else float("nan"))
-                else:
-                    needs[outcome].append(float(n))
-
-            # for outcomes not present this tick (rare), we still must keep aligned length:
-            # easiest: do nothing; lines will have shorter arrays, still OK.
-
-            got = True
-        return got
-
-    def animate(_frame):
-        updated = drain_queue()
-        if not updated:
-            # return artists (doesn't matter blit=False)
-            return []
-
-        xs = list(ts)
-
-        artists = []
-
-        # update each outcome line with its own length (might be shorter than xs)
-        for outcome in list(asks.keys()):
-            ya = list(asks[outcome])
-            yn = list(needs[outcome])
-
-            # align x with y length
-            x_use = xs[-len(ya):] if len(ya) <= len(xs) else xs
-
-            lines_ask[outcome].set_data(x_use, ya)
-            lines_need[outcome].set_data(x_use, yn)
-
-            # feasible dots: ask <= need
-            cx, cy = [], []
-            for x, a, n in zip(x_use, ya, yn):
-                if (not math.isnan(a)) and (not math.isnan(n)) and (a <= n):
-                    cx.append(x)
-                    cy.append(a)
-
-            if cx:
-                scatters[outcome].set_offsets(np.column_stack([cx, cy]))
-            else:
-                scatters[outcome].set_offsets(np.empty((0, 2)))
-
-            artists.extend([lines_ask[outcome], lines_need[outcome], scatters[outcome]])
-
-        ax.relim()
-        ax.autoscale_view()
-
-        ymin, ymax = ax.get_ylim()
-        ax.set_ylim(max(0.0, ymin - 0.01), min(1.0, ymax + 0.01))
-        fig.autofmt_xdate()
-
-        return artists
-
-    def on_close(_evt):
-        stop_flag.set()
-
-    fig.canvas.mpl_connect("close_event", on_close)
-
-    _ani = FuncAnimation(
-        fig,
-        animate,
-        interval=graph_refresh_ms,
-        blit=False,
-        cache_frame_data=False,
-    )
-
-    plt.show()
-
-    stop_flag.set()
-    t.join(timeout=2.0)
-
-
+            loop.remove_signal_handler(signal.SIGINT)
+        except Exception:
+            pass
 # -----------------------------
 # CLI
 # -----------------------------
@@ -850,11 +812,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_live.add_argument("--hours", type=float, default=24.0)
     p_live.add_argument("--open_fee", type=float, default=0.00045)
     p_live.add_argument("--close_fee", type=float, default=0.00018)
-
     p_live.add_argument("--both", action="store_true", help="Compute hedge for BOTH outcomes in the market")
-    p_live.add_argument("--graph", action="store_true", help="Show Ask vs NeedAsk graph (no lag)")
-    p_live.add_argument("--graph_points", type=int, default=200, help="Max points on graph")
-    p_live.add_argument("--graph_refresh_ms", type=int, default=500, help="Graph refresh interval in ms")
+
+    # graph = collect then plot once (no live updates)
+    p_live.add_argument("--graph", action="store_true", help="Collect points; on Ctrl+C plot ONCE (no lag)")
+    p_live.add_argument("--graph_points", type=int, default=200, help="Max points kept for graph")
+    p_live.add_argument("--save_png", default=None, help="Save graph to PNG on stop (optional)")
 
     return p
 
@@ -880,7 +843,7 @@ async def async_main():
 
     elif args.cmd == "live":
         if args.graph:
-            run_live_with_graph(
+            await run_live_collect_then_plot(
                 urls=args.url,
                 interval=args.interval,
                 binance_symbol=args.binance,
@@ -892,7 +855,7 @@ async def async_main():
                 open_fee_rate=args.open_fee,
                 close_fee_rate=args.close_fee,
                 max_points=args.graph_points,
-                graph_refresh_ms=args.graph_refresh_ms,
+                save_png=args.save_png,
             )
         else:
             await run_live(
