@@ -20,3 +20,7 @@ python main.py live \
 - Собирает точки бесконечно
 - Ctrl+C ОДИН раз  -> сохранит PNG для КАЖДОГО URL и продолжит
 - Ctrl+C ДВА раза  -> выйдет
+
+
+Ctrl+C once  -> save PNGs and CONTINUE
+Ctrl+C twice -> exit
