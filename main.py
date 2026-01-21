@@ -1,14 +1,44 @@
-# main.py
+"""
+python main.py live \
+  --url "https://polymarket.com/event/will-bitcoin-hit-80k-or-100k-first-272" \
+  --url "https://polymarket.com/event/will-bitcoin-hit-80k-or-150k-first" \
+  --outcome "100k" \
+  --stake 100 \
+  --target_plus 10 \
+  --interval 10 \
+  --both \
+  --graph \
+  --png_prefix "graphs/graph"
+
+ ^
+ |
+ |
+ |
+(put this in terminal)
+
+
+Как работает graph-mode:
+- Собирает точки бесконечно
+- Ctrl+C ОДИН раз  -> сохранит PNG для КАЖДОГО URL и продолжит
+- Ctrl+C ДВА раза  -> выйдет
+
+PNG будут:
+graphs/graph_<slug-события>.png
+"""
+
 import argparse
 import asyncio
 import json
 import math
+import os
+import random
 import re
+import signal
 import ssl
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
-import signal
+
 import aiohttp
 import certifi
 
@@ -16,21 +46,17 @@ POLY_GAMMA = "https://gamma-api.polymarket.com"
 POLY_CLOB = "https://clob.polymarket.com"
 BINANCE_FAPI = "https://fapi.binance.com"
 
-
 # -----------------------------
 # Utils
 # -----------------------------
 def make_ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=certifi.where())
 
-
 def now_str() -> str:
     return f"{datetime.now():%Y-%m-%d %H:%M:%S}"
 
-
 def blank(n: int = 1):
     print("\n" * max(0, n), end="")
-
 
 def extract_event_slug(url: str) -> str:
     m = re.search(r"/event/([^/?#]+)", url)
@@ -38,6 +64,10 @@ def extract_event_slug(url: str) -> str:
         raise ValueError(f"Не смог вытащить slug из URL: {url}")
     return m.group(1)
 
+def safe_slug(url: str) -> str:
+    slug = extract_event_slug(url)
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", slug)
+    return slug.strip("_") or "event"
 
 def _maybe_json(x):
     if isinstance(x, str):
@@ -49,7 +79,6 @@ def _maybe_json(x):
                 return x
     return x
 
-
 def best_bid_ask(book: dict) -> Tuple[Optional[float], Optional[float]]:
     bids = book.get("bids") or []
     asks = book.get("asks") or []
@@ -60,7 +89,6 @@ def best_bid_ask(book: dict) -> Tuple[Optional[float], Optional[float]]:
     if asks:
         best_ask = min(float(a["price"]) for a in asks if "price" in a)
     return best_bid, best_ask
-
 
 def parse_levels_from_text(text: str) -> List[float]:
     t = (text or "").lower().replace(",", "")
@@ -74,11 +102,9 @@ def parse_levels_from_text(text: str) -> List[float]:
     uniq = sorted(set(int(x) for x in levels))
     return [float(x) for x in uniq]
 
-
 def extract_level_from_outcome(outcome: str) -> Optional[float]:
     lv = parse_levels_from_text(outcome)
     return lv[0] if lv else None
-
 
 # -----------------------------
 # Dataclasses
@@ -90,32 +116,69 @@ class OutcomeQuote:
     best_bid: Optional[float]
     best_ask: Optional[float]
 
-
 @dataclass
 class GraphPoint:
     ts: datetime
     # list of (outcome, ask, need_ask)
     series: List[Tuple[str, Optional[float], Optional[float]]]
 
+# -----------------------------
+# Robust HTTP helper (retries)
+# -----------------------------
+_RETRYABLE = (
+    aiohttp.ClientOSError,
+    aiohttp.ServerDisconnectedError,
+    aiohttp.ClientConnectionError,
+    aiohttp.ClientPayloadError,
+    asyncio.TimeoutError,
+)
+
+async def _request_json(
+    session: aiohttp.ClientSession,
+    method: str,
+    url: str,
+    *,
+    params: Optional[dict] = None,
+    json_body: Optional[dict] = None,
+    timeout: int = 15,
+    retries: int = 6,
+    base_delay: float = 0.4,
+) -> dict:
+    last_err: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            if method.upper() == "GET":
+                async with session.get(url, params=params, timeout=timeout) as r:
+                    r.raise_for_status()
+                    return await r.json()
+            elif method.upper() == "POST":
+                async with session.post(url, params=params, json=json_body, timeout=timeout) as r:
+                    r.raise_for_status()
+                    return await r.json()
+            else:
+                raise ValueError(f"Unsupported method: {method}")
+        except _RETRYABLE as e:
+            last_err = e
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 0.25)
+            print(f"[NET] {method} {url} failed ({type(e).__name__}: {e}) -> retry in {delay:.2f}s ({attempt+1}/{retries})")
+            await asyncio.sleep(delay)
+        except Exception as e:
+            # не retry-ошибка: пусть пробрасывается наверх
+            raise
+    assert last_err is not None
+    raise last_err
 
 # -----------------------------
 # Polymarket (Gamma & CLOB)
 # -----------------------------
 async def gamma_get_event_by_slug(session: aiohttp.ClientSession, slug: str) -> dict:
-    async with session.get(f"{POLY_GAMMA}/events/slug/{slug}", timeout=15) as r:
-        r.raise_for_status()
-        return await r.json()
-
+    return await _request_json(session, "GET", f"{POLY_GAMMA}/events/slug/{slug}", timeout=15)
 
 async def gamma_get_market_by_slug(session: aiohttp.ClientSession, slug: str) -> dict:
-    params = {"slug": slug, "limit": 1}
-    async with session.get(f"{POLY_GAMMA}/markets", params=params, timeout=15) as r:
-        r.raise_for_status()
-        data = await r.json()
+    data = await _request_json(session, "GET", f"{POLY_GAMMA}/markets", params={"slug": slug, "limit": 1}, timeout=15)
     if not data:
         raise RuntimeError(f"Gamma не вернул market по slug={slug}.")
     return data[0]
-
 
 def market_outcome_token_map(market: dict) -> List[Tuple[str, str]]:
     outcomes = _maybe_json(market.get("outcomes"))
@@ -130,27 +193,19 @@ def market_outcome_token_map(market: dict) -> List[Tuple[str, str]]:
         raise RuntimeError(f"outcomes и token_ids разной длины: {len(outcomes)} vs {len(token_ids)}")
     return list(zip([str(o) for o in outcomes], [str(t) for t in token_ids]))
 
-
 async def clob_get_books(session: aiohttp.ClientSession, token_ids: List[str]) -> Dict[str, dict]:
     payload = [{"token_id": tid} for tid in token_ids]
-    async with session.post(f"{POLY_CLOB}/books", json=payload, timeout=15) as r:
-        r.raise_for_status()
-        books = await r.json()
-    by_token = {}
+    books = await _request_json(session, "POST", f"{POLY_CLOB}/books", json_body=payload, timeout=15)
+    by_token: Dict[str, dict] = {}
     for b in books:
         asset_id = str(b.get("asset_id") or b.get("token_id") or "")
         if asset_id:
             by_token[asset_id] = b
     return by_token
 
-
 async def polymarket_fee_rate_bps(session: aiohttp.ClientSession, token_id: str) -> int:
-    params = {"token_id": token_id}
-    async with session.get(f"{POLY_CLOB}/fee-rate", params=params, timeout=15) as r:
-        r.raise_for_status()
-        data = await r.json()
+    data = await _request_json(session, "GET", f"{POLY_CLOB}/fee-rate", params={"token_id": token_id}, timeout=15)
     return int(data.get("fee_rate_bps", 0))
-
 
 # -----------------------------
 # Polymarket fee approximation (simple)
@@ -167,7 +222,6 @@ _POLY_FEE_CURVE = [
     (0.90, 0.0020),
 ]
 
-
 def _interp_fee_rate(price: float) -> float:
     p = max(0.01, min(0.99, float(price)))
     pts = _POLY_FEE_CURVE
@@ -181,13 +235,11 @@ def _interp_fee_rate(price: float) -> float:
             return y1 + t * (y2 - y1)
     return 0.0
 
-
 def polymarket_trade_fee(trade_value_usdc: float, price: float, fee_rate_bps: int) -> float:
     if fee_rate_bps <= 0:
         return 0.0
     eff = _interp_fee_rate(price)
     return trade_value_usdc * eff
-
 
 def polymarket_pnl(stake_usdc: float, fill_price: float, fee_rate_bps: int) -> dict:
     p = float(fill_price)
@@ -197,20 +249,12 @@ def polymarket_pnl(stake_usdc: float, fill_price: float, fee_rate_bps: int) -> d
     pnl_lose = -stake_usdc - fee
     return {"shares": shares, "fee": fee, "pnl_win": pnl_win, "pnl_lose": pnl_lose}
 
-
 # -----------------------------
 # Binance futures
 # -----------------------------
 async def binance_premium_index(session: aiohttp.ClientSession, symbol: str) -> dict:
-    params = {"symbol": symbol}
-    async with session.get(f"{BINANCE_FAPI}/fapi/v1/premiumIndex", params=params, timeout=15) as r:
-        r.raise_for_status()
-        data = await r.json()
-    return {
-        "markPrice": float(data["markPrice"]),
-        "lastFundingRate": float(data.get("lastFundingRate", 0.0)),
-    }
-
+    data = await _request_json(session, "GET", f"{BINANCE_FAPI}/fapi/v1/premiumIndex", params={"symbol": symbol}, timeout=15)
+    return {"markPrice": float(data["markPrice"]), "lastFundingRate": float(data.get("lastFundingRate", 0.0))}
 
 def futures_pnl_per_1btc(
     side: str,
@@ -221,7 +265,6 @@ def futures_pnl_per_1btc(
     funding_rate_per_8h: float,
     expected_hours: float,
 ) -> float:
-    # side: "long" or "short"
     s = 1.0 if side.lower() == "long" else -1.0
     periods = max(0, math.ceil(max(0.0, expected_hours) / 8.0))
     pnl_price = s * (exit_price - entry)
@@ -230,9 +273,7 @@ def futures_pnl_per_1btc(
     funding_payment = s * funding_rate_per_8h * entry * periods
     return pnl_price - fee_open - fee_close - funding_payment
 
-
 def pretty_position(side_model: str, qty_btc_model: float) -> Tuple[str, float]:
-    # qty_btc_model is in "model-side" space; if negative => opposite side.
     if math.isnan(qty_btc_model):
         return ("UNKNOWN", float("nan"))
     if abs(qty_btc_model) < 1e-18:
@@ -240,7 +281,6 @@ def pretty_position(side_model: str, qty_btc_model: float) -> Tuple[str, float]:
     if qty_btc_model > 0:
         return ("LONG" if side_model.lower() == "long" else "SHORT", abs(qty_btc_model))
     return ("SHORT" if side_model.lower() == "long" else "LONG", abs(qty_btc_model))
-
 
 # -----------------------------
 # Load event/markets
@@ -260,23 +300,21 @@ async def load_event_markets(session: aiohttp.ClientSession, event_url: str) -> 
     title = market.get("question") or slug
     return title, [market]
 
-
 # -----------------------------
 # Printing
 # -----------------------------
 def print_monitor_lines(quotes: List[OutcomeQuote]):
+    print("  🎯 OUTCOMES")
     for q in quotes:
         bid_s = f"{q.best_bid:.4f}" if q.best_bid is not None else "—"
         ask_s = f"{q.best_ask:.4f}" if q.best_ask is not None else "—"
-        print(f"  {q.outcome:<6}  bid {bid_s:<7} ask {ask_s:<7}")
+        print(f"    {q.outcome:<6} | bid {bid_s:<7} | ask {ask_s:<7}")
 
-    # internal arb only if Σasks < 1
     asks = [q.best_ask for q in quotes if q.best_ask is not None]
     if len(asks) == len(quotes):
         s = sum(asks)
         if s < 1.0:
-            print(f"  ✅ INTERNAL-ARB: Σasks={s:.4f} (edge={1.0 - s:.4f})")
-
+            print(f"  💡 INTERNAL ARB: Σasks={s:.4f} (edge={1.0 - s:.4f})")
 
 # -----------------------------
 # Hedge math
@@ -285,7 +323,6 @@ def solve_qty_for_win_zero(poly_pnl_win: float, fut_per1_win: float) -> Optional
     if abs(fut_per1_win) < 1e-12:
         return None
     return -poly_pnl_win / fut_per1_win
-
 
 def required_poly_ask_for_target(
     stake_usdc: float,
@@ -318,7 +355,6 @@ def required_poly_ask_for_target(
             hi = mid
     return best
 
-
 async def compute_hedge_for_outcome(
     session: aiohttp.ClientSession,
     pairs: List[Tuple[str, str]],
@@ -332,20 +368,15 @@ async def compute_hedge_for_outcome(
     open_fee_rate: float,
     close_fee_rate: float,
 ) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Prints compact hedge block.
-    Returns (ask, need_ask).
-    """
     books = await clob_get_books(session, [token_id])
     _bid, ask = best_bid_ask(books.get(token_id, {}))
     if ask is None:
-        print(f"  HEDGE({outcome_name}): no ask")
+        print(f"  📌 HEDGE({outcome_name})  -> no ask")
         return None, None
 
     fee_bps = await polymarket_fee_rate_bps(session, token_id)
     poly = polymarket_pnl(stake_usdc, ask, fee_bps)
 
-    # parse barriers from outcomes like "80k"/"100k"
     outcome_levels: Dict[str, float] = {}
     for o, _tid in pairs:
         lv = extract_level_from_outcome(o)
@@ -360,35 +391,28 @@ async def compute_hedge_for_outcome(
             lose_exit = others[0]
 
     if win_exit is None or lose_exit is None:
-        print(f"  HEDGE({outcome_name}): can't parse barriers from outcomes")
+        print(f"  ⚠️ HEDGE({outcome_name}): can't parse barriers from outcomes")
         return float(ask), None
 
-    # try both model sides; pick one that maximizes LOSE total
-    best = None  # (side_model, qty_model, fut_win, fut_lose, lose_total, win_total)
+    best = None  # (side_model, qty_model, fut_win, fut_lose, lose_total)
     for side_model in ("long", "short"):
-        fut_win = futures_pnl_per_1btc(
-            side_model, entry, win_exit, open_fee_rate, close_fee_rate, fund, expected_hours
-        )
-        fut_lose = futures_pnl_per_1btc(
-            side_model, entry, lose_exit, open_fee_rate, close_fee_rate, fund, expected_hours
-        )
+        fut_win = futures_pnl_per_1btc(side_model, entry, win_exit, open_fee_rate, close_fee_rate, fund, expected_hours)
+        fut_lose = futures_pnl_per_1btc(side_model, entry, lose_exit, open_fee_rate, close_fee_rate, fund, expected_hours)
 
         qty_model = solve_qty_for_win_zero(poly["pnl_win"], fut_win)
         if qty_model is None:
             continue
 
-        win_total = poly["pnl_win"] + qty_model * fut_win
         lose_total = poly["pnl_lose"] + qty_model * fut_lose
-
-        cand = (side_model, qty_model, fut_win, fut_lose, lose_total, win_total)
+        cand = (side_model, qty_model, fut_win, fut_lose, lose_total)
         if best is None or cand[4] > best[4]:
             best = cand
 
     if best is None:
-        print(f"  HEDGE({outcome_name}): no hedge candidate")
+        print(f"  ⚠️ HEDGE({outcome_name}): no hedge candidate")
         return float(ask), None
 
-    side_model, qty_model, fut_win, fut_lose, lose_total, _win_total = best
+    side_model, qty_model, fut_win, fut_lose, lose_total = best
     eff_side, eff_qty_btc = pretty_position(side_model, qty_model)
     notional_usd = eff_qty_btc * entry
 
@@ -397,24 +421,24 @@ async def compute_hedge_for_outcome(
 
     ok = lose_total >= target_plus
 
-    need_ask = None
-    if not ok:
-        need_ask = required_poly_ask_for_target(stake_usdc, fee_bps, target_plus, fut_win, fut_lose)
+    # ВАЖНО: need_ask считаем ВСЕГДА, чтобы линия на графике не "пропадала"
+    need_ask = required_poly_ask_for_target(stake_usdc, fee_bps, target_plus, fut_win, fut_lose)
 
-    print(f"  HEDGE({outcome_name}): ask={ask:.4f} shares≈{poly['shares']:.2f}")
-    print(f"    Binance: {eff_side} ${notional_usd:.2f} notional ({eff_qty_btc:.6f} BTC)")
-    print(f"    WIN :  Poly {poly['pnl_win']:+.2f}, Binance {bin_win:+.2f} => Total {(poly['pnl_win']+bin_win):+.2f}")
-    print(f"    LOSE:  Poly {poly['pnl_lose']:+.2f}, Binance {bin_lose:+.2f} => Total {(poly['pnl_lose']+bin_lose):+.2f}")
-    if not ok:
-        if need_ask is None:
-            print("    ❌ not feasible (assumptions)")
-        else:
-            print(f"    ❌ need ask <= {need_ask:.4f} to be feasible")
+    print(f"  📌 HEDGE({outcome_name})")
+    print(f"    🎫 Trade: ask {ask:.4f}  |  shares ≈ {poly['shares']:.2f}")
+    print(f"    📉 Binance: {eff_side} ${notional_usd:.2f} notional ({eff_qty_btc:.6f} BTC)")
+    print(f"    WIN :  Poly {poly['pnl_win']:+.2f}, Binance {bin_win:+.2f}  →  Total {(poly['pnl_win']+bin_win):+.2f}")
+    print(f"    LOSE: Poly {poly['pnl_lose']:+.2f}, Binance {bin_lose:+.2f}  →  Total {(poly['pnl_lose']+bin_lose):+.2f}")
+
+    if ok:
+        print("    ✅✅✅💰 КНОПКА БАБЛО: и при WIN, и при LOSE в плюсе 💰✅✅✅")
     else:
-        print("  ✅✅✅ КНОПКА БАБЛО ✅✅✅")
+        if need_ask is None:
+            print("    🚫 Не получается сделать хедж (по текущим допущениям)")
+        else:
+            print(f"    🔻 Чтобы схема была ок: нужно ask ≤ {need_ask:.4f}")
 
     return float(ask), (None if need_ask is None else float(need_ask))
-
 
 # -----------------------------
 # One tick for one URL
@@ -442,7 +466,6 @@ async def compute_tick(
 
     chosen_pairs: Optional[List[Tuple[str, str]]] = None
 
-    # monitor all markets
     for m in markets:
         pairs = market_outcome_token_map(m)
         token_ids = [tid for _, tid in pairs]
@@ -455,7 +478,6 @@ async def compute_tick(
 
         print_monitor_lines(quotes)
 
-        # choose first "normal" market (2+ outcomes)
         if chosen_pairs is None and len(pairs) >= 2:
             chosen_pairs = pairs
 
@@ -482,7 +504,6 @@ async def compute_tick(
             )
             series.append((outcome_name, a, n))
     else:
-        # pick by substring
         needle = (buy_outcome or "").strip().lower()
         picked = None
         for o, tid in chosen_pairs:
@@ -511,19 +532,16 @@ async def compute_tick(
 
     return GraphPoint(datetime.now(), series)
 
-
 # -----------------------------
 # Modes
 # -----------------------------
 async def run_monitor(urls: List[str], interval: int, binance_symbol: str):
     ssl_ctx = make_ssl_context()
-    connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+    connector = aiohttp.TCPConnector(ssl=ssl_ctx, limit=20)
     async with aiohttp.ClientSession(connector=connector) as session:
         while True:
             prem = await binance_premium_index(session, binance_symbol)
-            print(
-                f"[{now_str()}] Binance {binance_symbol} mark={prem['markPrice']:.2f} funding8h={prem['lastFundingRate']:+.6%}"
-            )
+            print(f"[{now_str()}] Binance {binance_symbol} mark={prem['markPrice']:.2f} funding8h={prem['lastFundingRate']:+.6%}")
             for url in urls:
                 title, markets = await load_event_markets(session, url)
                 print(f"EVENT: {title}")
@@ -539,7 +557,6 @@ async def run_monitor(urls: List[str], interval: int, binance_symbol: str):
             blank(1)
             await asyncio.sleep(interval)
 
-
 async def run_hedge(
     urls: List[str],
     buy_outcome: str,
@@ -552,7 +569,7 @@ async def run_hedge(
     close_fee_rate: float,
 ):
     ssl_ctx = make_ssl_context()
-    connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+    connector = aiohttp.TCPConnector(ssl=ssl_ctx, limit=20)
     async with aiohttp.ClientSession(connector=connector) as session:
         for url in urls:
             await compute_tick(
@@ -568,7 +585,6 @@ async def run_hedge(
                 close_fee_rate=close_fee_rate,
             )
 
-
 async def run_live(
     urls: List[str],
     interval: int,
@@ -582,44 +598,42 @@ async def run_live(
     close_fee_rate: float,
 ):
     ssl_ctx = make_ssl_context()
-    connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+    connector = aiohttp.TCPConnector(ssl=ssl_ctx, limit=20)
     async with aiohttp.ClientSession(connector=connector) as session:
         while True:
             for url in urls:
-                await compute_tick(
-                    session=session,
-                    url=url,
-                    buy_outcome=buy_outcome,
-                    both=both,
-                    stake_usdc=stake_usdc,
-                    target_plus=target_plus,
-                    expected_hours=expected_hours,
-                    binance_symbol=binance_symbol,
-                    open_fee_rate=open_fee_rate,
-                    close_fee_rate=close_fee_rate,
-                )
+                try:
+                    await compute_tick(
+                        session=session,
+                        url=url,
+                        buy_outcome=buy_outcome,
+                        both=both,
+                        stake_usdc=stake_usdc,
+                        target_plus=target_plus,
+                        expected_hours=expected_hours,
+                        binance_symbol=binance_symbol,
+                        open_fee_rate=open_fee_rate,
+                        close_fee_rate=close_fee_rate,
+                    )
+                except Exception as e:
+                    print(f"[WARN] tick failed for {url}: {type(e).__name__}: {e}")
+                    continue
             blank(1)
             await asyncio.sleep(interval)
 
+# -----------------------------
+# Graph helpers: PNG only (no GUI)
+# -----------------------------
+def plot_points_to_png(points: List[GraphPoint], title: str, out_path: str):
+    if not points:
+        print(f"[PLOT] No points for {title}")
+        return
 
-# -----------------------------
-# Graph mode: collect then plot ONCE on stop (no live updates, no lag)
-# -----------------------------
-def plot_points_once(
-    points: List[GraphPoint],
-    save_png: Optional[str],
-    both: bool,
-    buy_outcome: str,
-):
-    import math as _math
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
 
-    if not points:
-        print("[PLOT] No points collected.")
-        return
-
-    # outcomes в порядке появления
     outcomes: List[str] = []
     seen = set()
     for p in points:
@@ -631,7 +645,7 @@ def plot_points_once(
     ts = [p.ts for p in points]
 
     fig, ax = plt.subplots(figsize=(13, 5))
-    ax.set_title(f"Ask vs NeedAsk ({'BOTH' if both else buy_outcome})")
+    ax.set_title(title)
     ax.set_xlabel("time")
     ax.set_ylabel("price")
     ax.grid(True, alpha=0.3)
@@ -656,7 +670,6 @@ def plot_points_once(
 
             a, n = found
             ask_y.append(float("nan") if a is None else float(a))
-
             if n is None:
                 need_y.append(last_need)
             else:
@@ -666,10 +679,9 @@ def plot_points_once(
         ax.plot(ts, ask_y, marker="o", markersize=3, linewidth=1.5, label=f"ask {outcome}")
         ax.plot(ts, need_y, linestyle="--", marker="o", markersize=3, linewidth=1.2, label=f"need {outcome}")
 
-        # feasible: ask <= need
         fx, fy = [], []
         for x, a, n in zip(ts, ask_y, need_y):
-            if (not _math.isnan(a)) and (not _math.isnan(n)) and (a <= n):
+            if (not math.isnan(a)) and (not math.isnan(n)) and (a <= n):
                 fx.append(x)
                 fy.append(a)
         if fx:
@@ -677,20 +689,16 @@ def plot_points_once(
 
     ax.legend(loc="upper right")
     fig.autofmt_xdate()
-
     ymin, ymax = ax.get_ylim()
     ax.set_ylim(max(0.0, ymin - 0.01), min(1.0, ymax + 0.01))
-
     plt.tight_layout()
 
-    if save_png:
-        fig.savefig(save_png, dpi=180, bbox_inches="tight")
-        print(f"[OK] saved graph -> {save_png}")
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] saved graph -> {out_path}")
 
-    plt.show()
-
-
-async def run_live_collect_then_plot(
+async def run_live_collect_then_png(
     urls: List[str],
     interval: int,
     binance_symbol: str,
@@ -702,83 +710,103 @@ async def run_live_collect_then_plot(
     open_fee_rate: float,
     close_fee_rate: float,
     max_points: int,
-    save_png: Optional[str],
-    exit_on_plot: bool = False,   # <- если True, то после графика выходим
+    png_prefix: str,
 ):
+    """
+    Бесконечный сбор.
+    Ctrl+C 1x -> сохранить PNG по каждому URL и продолжить
+    Ctrl+C 2x -> выйти
+    """
     ssl_ctx = make_ssl_context()
-    connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+    connector = aiohttp.TCPConnector(ssl=ssl_ctx, limit=20)
 
-    points: List[GraphPoint] = []
-    print("[INFO] graph mode: collecting points.")
-    print("[INFO] Ctrl+C once  -> plot/save and CONTINUE")
+    points_by_url: Dict[str, List[GraphPoint]] = {u: [] for u in urls}
+
+    print("[INFO] graph mode: collecting points (PNG only, no GUI).")
+    print("[INFO] Ctrl+C once  -> save PNGs and CONTINUE")
     print("[INFO] Ctrl+C twice -> exit")
 
     stop_now = False
-    want_plot = False
+    want_dump = False
     ctrlc_count = 0
 
     loop = asyncio.get_running_loop()
 
     def on_sigint():
-        nonlocal stop_now, want_plot, ctrlc_count
+        nonlocal stop_now, want_dump, ctrlc_count
         ctrlc_count += 1
         if ctrlc_count == 1:
-            want_plot = True
-            print("\n[STOP] Ctrl+C -> plotting once, then continuing...")
+            want_dump = True
+            print("\n[STOP] Ctrl+C -> saving PNGs, then continuing...")
         else:
             stop_now = True
             print("\n[STOP] Ctrl+C x2 -> exiting...")
 
-    # нормальный обработчик SIGINT вместо KeyboardInterrupt/CancelledError каши
-    loop.add_signal_handler(signal.SIGINT, on_sigint)
+    # macOS/Linux: норм. Windows: может быть NotImplementedError
+    installed_handler = False
+    try:
+        loop.add_signal_handler(signal.SIGINT, on_sigint)
+        installed_handler = True
+    except NotImplementedError:
+        installed_handler = False
 
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
             while not stop_now:
                 for url in urls:
-                    gp = await compute_tick(
-                        session=session,
-                        url=url,
-                        buy_outcome=buy_outcome,
-                        both=both,
-                        stake_usdc=stake_usdc,
-                        target_plus=target_plus,
-                        expected_hours=expected_hours,
-                        binance_symbol=binance_symbol,
-                        open_fee_rate=open_fee_rate,
-                        close_fee_rate=close_fee_rate,
-                    )
+                    try:
+                        gp = await compute_tick(
+                            session=session,
+                            url=url,
+                            buy_outcome=buy_outcome,
+                            both=both,
+                            stake_usdc=stake_usdc,
+                            target_plus=target_plus,
+                            expected_hours=expected_hours,
+                            binance_symbol=binance_symbol,
+                            open_fee_rate=open_fee_rate,
+                            close_fee_rate=close_fee_rate,
+                        )
+                    except KeyboardInterrupt:
+                        # если нет signal handler (например, на Windows), ловим тут
+                        want_dump = True
+                        ctrlc_count += 1
+                        if ctrlc_count >= 2:
+                            stop_now = True
+                        continue
+                    except Exception as e:
+                        print(f"[WARN] tick failed for {url}: {type(e).__name__}: {e}")
+                        continue
 
                     if gp.series:
-                        points.append(gp)
-                        if len(points) > max_points:
-                            points = points[-max_points:]
+                        arr = points_by_url[url]
+                        arr.append(gp)
+                        if len(arr) > max_points:
+                            points_by_url[url] = arr[-max_points:]
 
-                # если попросили график — рисуем/сохраняем и продолжаем
-                if want_plot:
-                    want_plot = False
-                    if points:
-                        plot_points_once(points=points, save_png=save_png, both=both, buy_outcome=buy_outcome)
-                        if exit_on_plot:
-                            break
-                    else:
-                        print("[WARN] no points collected yet -> nothing to plot.")
-
-                    # сбрасываем счетчик, чтобы следующий Ctrl+C снова был "plot"
+                if want_dump:
+                    want_dump = False
+                    for url in urls:
+                        pts = points_by_url.get(url, [])
+                        slug = safe_slug(url)
+                        out_path = f"{png_prefix}_{slug}.png"
+                        title = f"Ask vs NeedAsk ({'BOTH' if both else buy_outcome})\n{slug}"
+                        plot_points_to_png(pts, title=title, out_path=out_path)
                     ctrlc_count = 0
 
-                # сон делаем маленькими кусками, чтобы быстрее реагировать на Ctrl+C
+                # отзывчивый сон
                 for _ in range(max(1, int(interval * 10))):
-                    if stop_now or want_plot:
+                    if stop_now or want_dump:
                         break
                     await asyncio.sleep(0.1)
 
     finally:
-        # возвращаем стандартный SIGINT handler (чтобы в других местах не ломалось)
-        try:
-            loop.remove_signal_handler(signal.SIGINT)
-        except Exception:
-            pass
+        if installed_handler:
+            try:
+                loop.remove_signal_handler(signal.SIGINT)
+            except Exception:
+                pass
+
 # -----------------------------
 # CLI
 # -----------------------------
@@ -800,7 +828,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_hedge.add_argument("--binance", default="BTCUSDT")
     p_hedge.add_argument("--open_fee", type=float, default=0.00045)
     p_hedge.add_argument("--close_fee", type=float, default=0.00018)
-    p_hedge.add_argument("--both", action="store_true", help="Compute hedge for BOTH outcomes in the market")
+    p_hedge.add_argument("--both", action="store_true")
 
     p_live = sub.add_parser("live", help="Live: monitor + hedge")
     p_live.add_argument("--url", action="append", required=True)
@@ -812,15 +840,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_live.add_argument("--hours", type=float, default=24.0)
     p_live.add_argument("--open_fee", type=float, default=0.00045)
     p_live.add_argument("--close_fee", type=float, default=0.00018)
-    p_live.add_argument("--both", action="store_true", help="Compute hedge for BOTH outcomes in the market")
+    p_live.add_argument("--both", action="store_true")
 
-    # graph = collect then plot once (no live updates)
-    p_live.add_argument("--graph", action="store_true", help="Collect points; on Ctrl+C plot ONCE (no lag)")
-    p_live.add_argument("--graph_points", type=int, default=200, help="Max points kept for graph")
-    p_live.add_argument("--save_png", default=None, help="Save graph to PNG on stop (optional)")
+    p_live.add_argument("--graph", action="store_true", help="Collect points; Ctrl+C saves PNGs (no GUI)")
+    p_live.add_argument("--graph_points", type=int, default=200, help="Max points kept for graph per URL")
+    p_live.add_argument("--png_prefix", default="graph", help="Prefix for PNG files, e.g. graphs/graph")
 
     return p
-
 
 async def async_main():
     args = build_parser().parse_args()
@@ -843,7 +869,7 @@ async def async_main():
 
     elif args.cmd == "live":
         if args.graph:
-            await run_live_collect_then_plot(
+            await run_live_collect_then_png(
                 urls=args.url,
                 interval=args.interval,
                 binance_symbol=args.binance,
@@ -855,7 +881,7 @@ async def async_main():
                 open_fee_rate=args.open_fee,
                 close_fee_rate=args.close_fee,
                 max_points=args.graph_points,
-                save_png=args.save_png,
+                png_prefix=args.png_prefix,
             )
         else:
             await run_live(
@@ -870,10 +896,8 @@ async def async_main():
                 open_fee_rate=args.open_fee,
                 close_fee_rate=args.close_fee,
             )
-
     else:
         raise RuntimeError("Unknown cmd")
-
 
 if __name__ == "__main__":
     asyncio.run(async_main())
